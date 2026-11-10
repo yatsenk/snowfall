@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use wgpu::util::DeviceExt;
 
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -6,6 +7,28 @@ use winit::event_loop::ActiveEventLoop;
 use winit::event_loop::{ControlFlow, EventLoop, OwnedDisplayHandle};
 use winit::window::Fullscreen;
 use winit::window::{Window, WindowId};
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+const VERTICES: &[Vertex] = &[
+    Vertex {
+        position: [0.0, 0.5, 0.0],
+        color: [1.0, 0.0, 0.0],
+    },
+    Vertex {
+        position: [-0.5, -0.5, 0.0],
+        color: [0.0, 1.0, 0.0],
+    },
+    Vertex {
+        position: [0.5, -0.5, 0.0],
+        color: [0.0, 0.0, 1.0],
+    },
+];
 
 struct State {
     instance: wgpu::Instance,
@@ -17,6 +40,7 @@ struct State {
     surface_format: wgpu::TextureFormat,
     config: wgpu::SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
 }
 
 impl State {
@@ -124,6 +148,12 @@ impl State {
             cache: None,
         });
 
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
         let state = State {
             instance,
             window,
@@ -134,6 +164,7 @@ impl State {
             surface_format,
             config,
             render_pipeline,
+            vertex_buffer,
         };
 
         // Configure surface for the first time
