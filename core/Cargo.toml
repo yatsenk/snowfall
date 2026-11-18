@@ -1,0 +1,9 @@
+[package]
+name = "snowfall-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = { workspace = true }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
