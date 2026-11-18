@@ -22,3 +22,6 @@ Physics is calculated on the GPU (using wgpu compute shaders), and rendering is 
 
 
 To exit: **Ctrl+Alt+Shift+Q**. There is no interface or system tray icon.
+
+### Windows (x86_64)
+[![Download Snowfall](https://img.shields.io/badge/Download-snowfall.exe-2496ED?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/yatsenk/snowfall/releases/download/0.1.0/snowfall-x86_64-pc-windows-msvc.exe)
