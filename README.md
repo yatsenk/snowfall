@@ -7,10 +7,18 @@ A lightweight snowfall overlay for the Windows desktop. It consists of a transpa
 Physics is calculated on the GPU (using wgpu compute shaders), and rendering is performed via two instanced draw calls. The CPU polls the list of windows once every 200 ms and otherwise remains idle.
 
 
-## Build and Run
-```
-cargo run --release
-```
+### Installation & Run
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/yatsenk/snowfall.git
+   cd snowfall
+   ```
+
+2. **Build and Run**
+   ```bash
+   cargo run --release
+   ```
 
 
 To exit: **Ctrl+Alt+Shift+Q**. There is no interface or system tray icon.
