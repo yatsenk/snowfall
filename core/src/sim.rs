@@ -10,6 +10,9 @@ pub const BIN: f32 = 4.0;
 const FLAKES: u32 = 700;
 const DEBRIS: u32 = 4096; // power of two, so the spawn counter wraps cleanly
 const PARTICLE_SIZE: u64 = 32;
+const DEPOSITS: u64 = 8192; // FIFO of snow deposits (see sim.wgsl)
+const DEPOSIT_SIZE: u64 = 12;
+const POP_BATCH: u32 = 1024; // max deposits expired per frame
 const WORKGROUP: u32 = 64;
 
 #[repr(C)]
@@ -24,7 +27,8 @@ pub struct Params {
     pub nodes: u32,
     pub slot_count: u32,
     bin: f32,
-    _pad: [u32; 2],
+    clock: f32, // monotonic seconds, never wraps (deposit expiry)
+    _pad: u32,
 }
 
 pub struct Sim {
@@ -33,15 +37,18 @@ pub struct Sim {
     pub particles: wgpu::Buffer,
     pub surfaces: wgpu::Buffer,
     pub heights: wgpu::Buffer,
-    counter: wgpu::Buffer,
+    counters: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     update: wgpu::ComputePipeline,
     release: wgpu::ComputePipeline,
+    pop: wgpu::ComputePipeline,
+    advance: wgpu::ComputePipeline,
     init: wgpu::ComputePipeline,
     settle_even: wgpu::ComputePipeline,
     settle_odd: wgpu::ComputePipeline,
     slots: Slots,
     time: f32,
+    clock: f32,
 }
 
 pub(crate) fn buffer_binding(
@@ -78,7 +85,8 @@ impl Sim {
             nodes,
             slot_count: slots.used(),
             bin: BIN,
-            _pad: [0; 2],
+            clock: 0.0,
+            _pad: 0,
         };
 
         let buffer = |size: u64, usage: wgpu::BufferUsages| {
@@ -89,7 +97,9 @@ impl Sim {
         let particles = buffer(particle_count as u64 * PARTICLE_SIZE, U::STORAGE | U::VERTEX);
         let surfaces = buffer((MAX_SLOTS * std::mem::size_of::<crate::surfaces::Surface>()) as u64, U::STORAGE | U::COPY_DST);
         let heights = buffer(MAX_SLOTS as u64 * nodes as u64 * 4, U::STORAGE);
-        let counter = buffer(4, U::STORAGE | U::COPY_DST);
+        // [spawn, tail, head, popped]
+        let counters = buffer(16, U::STORAGE | U::COPY_DST);
+        let deposits = buffer(DEPOSITS * DEPOSIT_SIZE, U::STORAGE);
 
         use wgpu::BufferBindingType as B;
         let cs = wgpu::ShaderStages::COMPUTE;
@@ -101,6 +111,7 @@ impl Sim {
                 buffer_binding(2, cs, B::Storage { read_only: true }),
                 buffer_binding(3, cs, B::Storage { read_only: false }),
                 buffer_binding(4, cs, B::Storage { read_only: false }),
+                buffer_binding(5, cs, B::Storage { read_only: false }),
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -111,7 +122,8 @@ impl Sim {
                 bind_entry(1, &particles),
                 bind_entry(2, &surfaces),
                 bind_entry(3, &heights),
-                bind_entry(4, &counter),
+                bind_entry(4, &counters),
+                bind_entry(5, &deposits),
             ],
         });
 
@@ -142,15 +154,18 @@ impl Sim {
             particles,
             surfaces,
             heights,
-            counter,
+            counters,
             bind_group,
             update: pipeline("update_particles"),
             release: pipeline("release_snow"),
+            pop: pipeline("pop_deposits"),
+            advance: pipeline("advance_head"),
             init: pipeline("init_world"),
             settle_even: pipeline("settle_even"),
             settle_odd: pipeline("settle_odd"),
             slots,
             time: 0.0,
+            clock: 0.0,
         };
         gpu.queue.write_buffer(&sim.surfaces, 0, bytemuck::cast_slice(sim.slots.gpu()));
         sim.reset(gpu);
@@ -159,7 +174,7 @@ impl Sim {
 
     /// Start over: flakes above the screen, no debris, no drifts.
     pub fn reset(&mut self, gpu: &Gpu) {
-        gpu.queue.write_buffer(&self.counter, 0, &[0u8; 4]);
+        gpu.queue.write_buffer(&self.counters, 0, &[0u8; 16]);
         self.next_frame(gpu);
         let threads = self.params.particle_count.max(MAX_SLOTS as u32 * self.params.nodes);
         self.submit(gpu, |s, pass| s.dispatch(pass, &s.init, threads));
@@ -183,11 +198,15 @@ impl Sim {
         self.params.dt = dt;
         self.time = (self.time + dt) % 3600.0;
         self.params.time = self.time;
+        self.clock += dt;
+        self.params.clock = self.clock;
         self.next_frame(gpu);
 
         let mut pass = enc.begin_compute_pass(&Default::default());
         pass.set_bind_group(0, &self.bind_group, &[]);
         self.dispatch(&mut pass, &self.update, self.params.particle_count);
+        self.dispatch(&mut pass, &self.pop, POP_BATCH); // oldest deposits expire (FIFO)
+        self.dispatch(&mut pass, &self.advance, 1);
         let pairs = self.params.slot_count * (self.params.nodes / 2);
         self.dispatch(&mut pass, &self.settle_even, pairs);
         self.dispatch(&mut pass, &self.settle_odd, pairs);

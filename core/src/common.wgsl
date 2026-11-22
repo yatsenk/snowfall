@@ -10,8 +10,8 @@ struct Params {
     nodes: u32,        // height nodes per surface slot
     slot_count: u32,   // slots in use (active or being released)
     bin: f32,          // distance between height nodes, px
-    _pad0: u32,
-    _pad1: u32,
+    clock: f32,        // monotonic seconds, never wraps (deposit expiry)
+    _pad: u32,
 };
 
 // One 32-byte record for both snowflakes (index < flake_count) and falling debris.

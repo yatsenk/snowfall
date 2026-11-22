@@ -2,7 +2,21 @@
 
 @group(0) @binding(1) var<storage, read_write> particles: array<Particle>;
 @group(0) @binding(3) var<storage, read_write> heights: array<atomic<i32>>;
-@group(0) @binding(4) var<storage, read_write> spawn_counter: atomic<u32>;
+@group(0) @binding(4) var<storage, read_write> counters: array<atomic<u32>, 4>;
+@group(0) @binding(5) var<storage, read_write> deposits: array<Deposit>;
+
+// Every bit of snow that lands is logged here. The log is a FIFO ring buffer:
+// when an entry is SNOW_LIFE seconds old, exactly that snow is removed again.
+struct Deposit {
+    node: u32,      // slot * nodes + node it landed on
+    amount: u32,    // fixed-point (FX) snow mass
+    expire: f32,    // g.clock at which it goes away
+};
+
+const SPAWN: u32 = 0u;   // debris ring-buffer cursor
+const TAIL: u32 = 1u;    // next deposit to be written
+const HEAD: u32 = 2u;    // oldest deposit still alive
+const POPPED: u32 = 3u;  // deposits expired this frame (head advance)
 
 const TAU: f32 = 6.28318530718;
 
@@ -11,8 +25,8 @@ const FLAKE_ALPHA: f32 = 0.22;      // + up to FLAKE_ALPHA_VAR: keep it subtle, 
 const FLAKE_ALPHA_VAR: f32 = 0.28;
 const AMOUNT_PER_AREA: f32 = 0.7;   // drift height gained per flake r^2
 const SLOPE: f32 = 2.0;             // average max height step between neighbour nodes
-const MELT_RATE: f32 = 0.012;       // fraction of a drift that melts per second
-const MELT_FLAT: f32 = 0.02;        // px/s that melt regardless of height
+const SNOW_LIFE: f32 = 40.0;        // seconds until a deposit is removed (oldest first)
+const OVERFLOW_MARGIN: u32 = 1024u; // log this close to full: expire oldest early
 const GRAVITY: f32 = 700.0;         // px/s^2 for falling debris
 const MAX_FALL: f32 = 800.0;        // debris terminal speed, px/s
 const DEBRIS_AMOUNT: f32 = 3.0;     // snow mass per debris particle
@@ -54,6 +68,10 @@ fn add_snow(k: u32, s: Surface, x: f32, amount: f32) {
     _ = atomicAdd(&heights[base + u32(n)], i32(a * 0.5 * FX));
     if (n > first) { _ = atomicAdd(&heights[base + u32(n - 1)], i32(a * 0.25 * FX)); }
     if (n < last) { _ = atomicAdd(&heights[base + u32(n + 1)], i32(a * 0.25 * FX)); }
+
+    // log it, so it can be removed when it is the oldest
+    let slot = atomicAdd(&counters[TAIL], 1u);
+    deposits[slot % arrayLength(&deposits)] = Deposit(base + u32(n), u32(a * FX), g.clock + SNOW_LIFE);
 }
 
 // A particle moved from `old_bottom` to `bottom`; if it reached a drift, melt it in.
@@ -169,7 +187,7 @@ fn release_snow(@builtin(global_invocation_id) id: vec3<u32>) {
     let count = min(u32(ceil(h / DEBRIS_AMOUNT)), MAX_CHUNKS);
     let amount = h / f32(count);
     let pool = g.particle_count - g.flake_count;
-    let base = atomicAdd(&spawn_counter, count);   // ring buffer: oldest debris gets overwritten
+    let base = atomicAdd(&counters[SPAWN], count);  // ring buffer: oldest debris gets overwritten
     var r = hash(idx ^ hash(g.frame));
     for (var j = 0u; j < count; j = j + 1u) {
         var d: Particle;
@@ -183,13 +201,58 @@ fn release_snow(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 }
 
-// Melting with stochastic rounding, so even very thin layers disappear eventually.
-fn melt(h: i32, r: ptr<function, u32>) -> i32 {
-    let units = (MELT_RATE * f32(h) + MELT_FLAT * FX) * g.dt * 0.5; // half per pass, two passes per frame
-    return i32(units + rnd(r));
+// ---------- FIFO: oldest snow goes first ----------
+
+// Remove up to `want` units from one node and return how much was really there.
+// (No compare-exchange: the DX12 backend does not implement it. Subtract, and if that
+// took more than was available, give the overshoot back. The node ends up >= 0.)
+fn take(idx: u32, want: i32) -> i32 {
+    let old = atomicAdd(&heights[idx], -want);
+    let got = clamp(old, 0, want);
+    if (got < want) { _ = atomicAdd(&heights[idx], want - got); }
+    return got;
 }
 
-// Spread snow downhill and melt it. Two passes (even/odd pairs) keep every pair exclusive.
+// Take the snow from the node it landed on; if slope relaxation has moved some of it
+// away, take the rest from the nearest neighbours.
+fn remove_snow(node: u32, amount: u32) {
+    let row = node / g.nodes;
+    let n = i32(node % g.nodes);
+    var left = i32(amount);
+    for (var j = 0; j < 5 && left > 0; j = j + 1) {
+        let off = (j + 1) / 2 * select(1, -1, (j & 1) == 1);   // 0, -1, +1, -2, +2
+        let t = n + off;
+        if (t < 0 || t >= i32(g.nodes)) { continue; }
+        left = left - take(row * g.nodes + u32(t), left);
+    }
+}
+
+// Each thread looks at one entry from the head of the log. Entries are ordered by
+// time, so the expired ones always form a prefix.
+@compute @workgroup_size(64)
+fn pop_deposits(@builtin(global_invocation_id) id: vec3<u32>) {
+    let head = atomicLoad(&counters[HEAD]);
+    let tail = atomicLoad(&counters[TAIL]);
+    let idx = head + id.x;
+    if (idx >= tail) { return; }
+    let ring = arrayLength(&deposits);
+    let d = deposits[idx % ring];
+    let overflow = tail - idx > ring - OVERFLOW_MARGIN;   // log nearly full: drop oldest early
+    if (d.expire > g.clock && !overflow) { return; }
+    remove_snow(d.node, d.amount);
+    _ = atomicAdd(&counters[POPPED], 1u);
+}
+
+@compute @workgroup_size(1)
+fn advance_head() {
+    let n = atomicLoad(&counters[POPPED]);   // single thread: no exchange needed
+    atomicStore(&counters[POPPED], 0u);
+    _ = atomicAdd(&counters[HEAD], n);
+}
+
+// ---------- spreading ----------
+
+// Spread snow downhill. Two passes (even/odd pairs) keep every pair exclusive.
 fn settle(id: u32, parity: u32) {
     let pairs = g.nodes / 2u;
     if (id >= g.slot_count * pairs) { return; }
@@ -210,10 +273,9 @@ fn settle(id: u32, parity: u32) {
     var m = 0;
     if (abs(d) > limit) { m = (abs(d) - limit) / 2 * sign(d); }
 
-    var r = hash(ia ^ hash(g.frame + parity));
     let cap = i32(MAX_H * FX);
-    let na = clamp(a - m - melt(a, &r), 0, cap);
-    let nb = clamp(b + m - melt(b, &r), 0, cap);
+    let na = clamp(a - m, 0, cap);
+    let nb = clamp(b + m, 0, cap);
     if (na != a) { atomicStore(&heights[ia], na); }
     if (nb != b) { atomicStore(&heights[ia + 1u], nb); }
 }
