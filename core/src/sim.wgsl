@@ -34,12 +34,6 @@ const MAX_CHUNKS: u32 = 4u;         // max debris particles per height node
 
 // ---------- random ----------
 
-fn hash(v: u32) -> u32 {
-    let s = v * 747796405u + 2891336453u;
-    let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
-    return (w >> 22u) ^ w;
-}
-
 fn rnd(s: ptr<function, u32>) -> f32 {
     *s = hash(*s);
     return f32(*s >> 8u) * (1.0 / 16777216.0);

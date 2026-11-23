@@ -1,4 +1,4 @@
-//! Drawing, three instanced draw calls fed straight from the GPU simulation buffers:
+//! Drawing, instanced draw calls fed straight from the GPU simulation buffers:
 //! 1. window rectangles -> stencil only (snow is cut out wherever a window is, so it
 //!    reads as being behind the windows even though the overlay is on top),
 //! 2. drifts, 3. snowflakes and debris.
@@ -8,10 +8,13 @@ use crate::sim::{bind_entry, buffer_binding, Sim};
 use crate::surfaces::Rect;
 
 const MAX_OCCLUDERS: usize = 128;
+// strands * arcs * bulbs, see GARLAND_* in render.wgsl
+const GARLAND_INSTANCES: u32 = 2 * 24 * 14;
 const PARTICLE_ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x4];
 
 pub struct Draw {
     occluder_pipeline: wgpu::RenderPipeline,
+    garland_pipeline: wgpu::RenderPipeline,
     pile_pipeline: wgpu::RenderPipeline,
     flake_pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
@@ -134,7 +137,8 @@ impl Draw {
                 wgpu::ColorWrites::empty(),
                 stencil_state(C::Always, Op::Replace),
             ),
-            // snow: only where the stencil is still 0
+            // garland and snow: only where the stencil is still 0
+            garland_pipeline: pipeline("vs_garland", "fs_garland", &[], all, stencil_state(C::Equal, Op::Keep)),
             pile_pipeline: pipeline("vs_pile", "fs_pile", &[], all, stencil_state(C::Equal, Op::Keep)),
             flake_pipeline: pipeline(
                 "vs_flake",
@@ -195,6 +199,8 @@ impl Draw {
         }
 
         pass.set_stencil_reference(0);
+        pass.set_pipeline(&self.garland_pipeline); // behind the snow
+        pass.draw(0..12, 0..GARLAND_INSTANCES);
         let p = &sim.params;
         pass.set_pipeline(&self.pile_pipeline); // drifts first, flakes on top
         pass.draw(0..6, 0..p.slot_count * (p.nodes - 1));
