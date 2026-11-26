@@ -42,9 +42,3 @@ const MAX_H: f32 = 14.0;   // hard cap on drift height, px (melting keeps it wel
 
 fn first_node(s: Surface) -> i32 { return i32(ceil(s.x0 / g.bin)); }
 fn last_node(s: Surface) -> i32 { return i32(floor(s.x1 / g.bin)); }
-
-fn hash(v: u32) -> u32 {
-    let s = v * 747796405u + 2891336453u;
-    let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
-    return (w >> 22u) ^ w;
-}
